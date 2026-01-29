@@ -1,5 +1,9 @@
 Captions is a text to teleprompter style video generator along with elevenlabs api based voiceover which is in sync with the text highlights.
 
+Demo:
+
+[![watch the video on instagram →](thumbnail.png)](https://www.instagram.com/reel/DUFVsB4iXNg/?utm_source=ig_web_copy_link)
+
 v1
 
 - Ask for input text in this cmd util
