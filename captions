@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+CONFIG_FILE = "config.json"
+DEFAULT_OUTPUT = "output.mp4"
+DEFAULT_FPS = 30
+BASE_FONT_COLOR = "#222222"
+HIGHLIGHT_BG_COLOR = "#222222"
+HIGHLIGHT_FONT_COLOR = "#DDDDDD"
+
+ASPECT_RATIOS = {
+    "4:5": (1080, 1350),
+    "1:1": (1080, 1080),
+}
+DEFAULT_ASPECT = "4:5"
+
+BACKGROUND_OPTIONS = {
+    # These are approximate brand-friendly tones chosen for a simple v1 default palette.
+    "Rose Gold": "#B76E79",
+    "Gray Green": "#dadbca",
+    "Geranium": "#da3d58",
+}
+DEFAULT_BACKGROUND = "Rose Gold"
+
+FONT_OPTIONS = {
+    "San Francisco (SF Pro)": "SF Pro Text",
+    "Helvetica Neue": "Helvetica Neue",
+    "Avenir": "Avenir",
+}
+DEFAULT_FONT = "San Francisco (SF Pro)"
+
+WEIGHT_OPTIONS = ["Light", "Medium", "Bold"]
+DEFAULT_WEIGHT = "Medium"
+
+DEFAULT_RESOLUTION = ASPECT_RATIOS[DEFAULT_ASPECT]
+# A slightly smaller font helps slow the scroll and keeps more context in view.
+FONT_SIZE = 82
+LINE_SPACING = int(FONT_SIZE * 0.25)
+
+NODE_RENDERER = os.path.join(os.path.dirname(__file__), "renderer", "render.js")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="captions",
+        description="Generate a teleprompter-style video with synced word highlights.",
+    )
+    parser.add_argument("--input", help="Path to input text file")
+    parser.add_argument("--output", help="Path to output mp4 file")
+    return parser.parse_args()
+
+
+def read_config(cwd):
+    path = os.path.join(cwd, CONFIG_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing {CONFIG_FILE} in {cwd}")
+
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    api_key = data.get("elevenlabsApiKey")
+    default_voice_id = data.get("defaultVoiceId")
+    if not api_key or not default_voice_id:
+        raise ValueError("config.json must include elevenlabsApiKey and defaultVoiceId")
+
+    voices = data.get("voices", [])
+    return {
+        "api_key": api_key,
+        "default_voice_id": default_voice_id,
+        "voices": voices,
+    }
+
+
+def prompt_multiline_text():
+    print(
+        "Paste your text below. End input with EOF (Ctrl-D on mac/linux, Ctrl-Z then Enter on Windows):"
+    )
+    # We read until EOF so users can paste multiple lines naturally without extra prompts.
+    text = sys.stdin.read()
+    return text.strip()
+
+
+def prompt_output_path():
+    try:
+        value = input(f"Output path [{DEFAULT_OUTPUT}]: ").strip()
+    except EOFError:
+        return DEFAULT_OUTPUT
+    return value or DEFAULT_OUTPUT
+
+
+def prompt_voice_choice(voices, default_voice_id):
+    if not voices:
+        return default_voice_id
+
+    print("\nChoose a voice (press Enter to use default):")
+    for index, voice in enumerate(voices, start=1):
+        label = voice.get("label") or voice.get("id") or f"Voice {index}"
+        print(f"  {index}) {label}")
+
+    try:
+        choice = input("Voice number: ").strip()
+    except EOFError:
+        return default_voice_id
+
+    if not choice:
+        return default_voice_id
+
+    if not choice.isdigit():
+        print("Invalid choice; using default voice.")
+        return default_voice_id
+
+    index = int(choice)
+    if index < 1 or index > len(voices):
+        print("Choice out of range; using default voice.")
+        return default_voice_id
+
+    selected = voices[index - 1]
+    return selected.get("id") or default_voice_id
+
+
+def prompt_choice(title, options, default_value):
+    print(f"\n{title}")
+    for index, option in enumerate(options, start=1):
+        default_marker = " (default)" if option == default_value else ""
+        print(f"  {index}) {option}{default_marker}")
+
+    try:
+        choice = input("Choice: ").strip()
+    except EOFError:
+        return default_value
+
+    if not choice:
+        return default_value
+
+    if not choice.isdigit():
+        print("Invalid choice; using default.")
+        return default_value
+
+    index = int(choice)
+    if index < 1 or index > len(options):
+        print("Choice out of range; using default.")
+        return default_value
+
+    return options[index - 1]
+
+
+def build_font_name(font_label, weight_label):
+    base = FONT_OPTIONS.get(font_label, font_label)
+    if weight_label:
+        # We append the weight label to match common system font naming conventions.
+        return f"{base} {weight_label}"
+    return base
+
+
+def select_style_defaults():
+    # Defaults keep the CLI usable in flag mode without extra prompts.
+    return {
+        "aspect": DEFAULT_ASPECT,
+        "resolution": DEFAULT_RESOLUTION,
+        "background": BACKGROUND_OPTIONS[DEFAULT_BACKGROUND],
+        "font_label": DEFAULT_FONT,
+        "font_weight": DEFAULT_WEIGHT,
+        "font_name": build_font_name(DEFAULT_FONT, DEFAULT_WEIGHT),
+    }
+
+
+def prompt_style_choices():
+    aspect = prompt_choice(
+        "Choose export aspect ratio:",
+        list(ASPECT_RATIOS.keys()),
+        DEFAULT_ASPECT,
+    )
+    background_label = prompt_choice(
+        "Choose background color:",
+        list(BACKGROUND_OPTIONS.keys()),
+        DEFAULT_BACKGROUND,
+    )
+    font_label = prompt_choice(
+        "Choose font:",
+        list(FONT_OPTIONS.keys()),
+        DEFAULT_FONT,
+    )
+    font_weight = prompt_choice(
+        "Choose font weight:",
+        WEIGHT_OPTIONS,
+        DEFAULT_WEIGHT,
+    )
+    return {
+        "aspect": aspect,
+        "resolution": ASPECT_RATIOS[aspect],
+        "background": BACKGROUND_OPTIONS[background_label],
+        "font_label": font_label,
+        "font_weight": font_weight,
+        "font_name": build_font_name(font_label, font_weight),
+    }
+
+
+def read_input_text(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+def ensure_tool_available(name):
+    if shutil.which(name) is None:
+        print(f"Required tool '{name}' is not available on PATH.")
+        sys.exit(1)
+
+
+def run_command(cmd, *, capture_output=False):
+    result = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+    )
+    if result.returncode != 0:
+        if capture_output:
+            raise RuntimeError(result.stderr.strip() or "Command failed")
+        raise RuntimeError("Command failed")
+    return result.stdout.strip() if capture_output else ""
+
+
+def run_node_renderer(data, output_path, resolution):
+    if not os.path.exists(NODE_RENDERER):
+        raise RuntimeError("Missing HTML renderer. Expected renderer/render.js")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # We pass a JSON payload to the HTML renderer so the browser can lay out text
+        # with proper wrapping and GSAP-driven highlights without rebuilding logic in Python.
+        data_path = os.path.join(temp_dir, "render-data.json")
+        with open(data_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+        width, height = resolution
+        cmd = [
+            "node",
+            NODE_RENDERER,
+            "--input",
+            data_path,
+            "--output",
+            output_path,
+            "--width",
+            str(width),
+            "--height",
+            str(height),
+            "--fps",
+            str(DEFAULT_FPS),
+        ]
+        run_command(cmd)
+
+
+def call_elevenlabs_tts(text, voice_id, api_key, output_path):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+    }
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "xi-api-key": api_key,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            audio_bytes = response.read()
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"ElevenLabs error: {exc.code} {error_body}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"ElevenLabs request failed: {exc.reason}")
+
+    with open(output_path, "wb") as handle:
+        handle.write(audio_bytes)
+
+
+def generate_silent_audio(duration_seconds, output_path):
+    # We generate silent audio to keep the video pipeline intact when TTS is disabled.
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=44100:cl=stereo",
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-q:a",
+            "9",
+            "-acodec",
+            "libmp3lame",
+            output_path,
+        ]
+    )
+
+
+def get_audio_duration_seconds(path):
+    # We use ffprobe for reliable duration rather than guessing from text length.
+    output = run_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            path,
+        ],
+        capture_output=True,
+    )
+    try:
+        return float(output)
+    except ValueError as exc:
+        raise RuntimeError("Unable to parse audio duration") from exc
+
+
+def tokenize(text):
+    # Keep punctuation attached to words so the rhythm feels closer to the spoken audio.
+    return re.findall(r"\S+", text)
+
+
+def build_layout_tokens(text):
+    # Preserve explicit line breaks while still tokenizing words for timing.
+    parts = re.split(r"(\n+)", text)
+    tokens = []
+    for part in parts:
+        if part == "":
+            continue
+        if part.startswith("\n"):
+            tokens.extend(["\n"] * len(part))
+        else:
+            tokens.extend(tokenize(part))
+    return tokens
+
+
+def sanitize_text(text):
+    # Keep broader Unicode (quotes, accents, emojis) and strip only control characters.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+
+def normalize_newlines(text):
+    # Normalize all newline variants to "\n" so layout tokens preserve blank lines.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def build_words_and_phrases(layout_tokens):
+    # Newlines act as hard phrase boundaries, even if punctuation is missing.
+    words = []
+    phrases = []
+    start_index = None
+    for token in layout_tokens:
+        if token == "\n":
+            if start_index is not None:
+                phrases.append((start_index, len(words) - 1))
+                start_index = None
+            continue
+
+        if start_index is None:
+            start_index = len(words)
+
+        words.append(token)
+
+        if re.search(r"[.!?;:]+$", token):
+            phrases.append((start_index, len(words) - 1))
+            start_index = None
+
+    if start_index is not None:
+        phrases.append((start_index, len(words) - 1))
+
+    return words, phrases
+
+
+def compute_phrase_durations(total_seconds, phrase_word_counts):
+    if not phrase_word_counts:
+        return []
+
+    total_words = sum(phrase_word_counts)
+    if total_words <= 0:
+        return [0.0 for _ in phrase_word_counts]
+
+    durations = []
+    for count in phrase_word_counts:
+        durations.append(total_seconds * (count / total_words))
+
+    # Adjust the last phrase to absorb floating-point drift.
+    durations[-1] += total_seconds - sum(durations)
+    return durations
+
+
+def estimate_duration_seconds(word_count, words_per_second=2.5):
+    if word_count <= 0:
+        return 0.0
+    return max(word_count / words_per_second, 1.0)
+
+
+def escape_drawtext_value(value):
+    return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def wrap_text(words, max_chars):
+    lines = []
+    word_line_index = []
+    current = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word)
+        projected = word_len if not current else current_len + 1 + word_len
+        if current and projected > max_chars:
+            lines.append(" ".join(current))
+            current = [word]
+            current_len = word_len
+        else:
+            if current:
+                current_len += 1 + word_len
+            else:
+                current_len = word_len
+            current.append(word)
+        word_line_index.append(len(lines))
+
+    if current:
+        lines.append(" ".join(current))
+
+    return lines, word_line_index
+
+
+def build_phrase_text(words, word_line_index, start, end):
+    lines = []
+    current = []
+    current_line = word_line_index[start]
+    for index in range(start, end + 1):
+        line_index = word_line_index[index]
+        if line_index != current_line:
+            lines.append(" ".join(current))
+            current = []
+            current_line = line_index
+        current.append(words[index])
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(lines)
+
+
+def render_scrolling_video(
+    text,
+    words,
+    phrases,
+    phrase_timings,
+    output_path,
+    resolution,
+    background_color,
+    font_name,
+):
+    width, height = resolution
+    # We use a rough character width approximation for line wrapping to avoid font-metric dependencies.
+    approx_char_width = max(int(FONT_SIZE * 0.6), 1)
+    max_chars = max(int(width / approx_char_width), 20)
+
+    lines, word_line_index = wrap_text(words, max_chars)
+    if not lines:
+        raise RuntimeError("Unable to layout text for rendering.")
+
+    base_text = "\n".join(lines)
+    line_height = FONT_SIZE + LINE_SPACING
+    text_height = len(lines) * line_height
+
+    total_duration = phrase_timings[-1][1] if phrase_timings else 0.0
+    if total_duration <= 0:
+        raise RuntimeError("Invalid duration for rendering.")
+
+    first_phrase_line = word_line_index[phrases[0][0]] if phrases else 0
+    initial_y = (height * 0.5) - (line_height * 0.5) - (first_phrase_line * line_height)
+    # We start with the first phrase near center and scroll steadily upward.
+    total_scroll_distance = (height * 0.5) + text_height
+    scroll_speed = total_scroll_distance / total_duration
+    top_y_expr = f"{initial_y:.3f}-{scroll_speed:.6f}*t"
+
+    escaped_font = escape_drawtext_value(font_name)
+    base_text_file = output_path + ".text"
+    with open(base_text_file, "w", encoding="utf-8") as handle:
+        handle.write(base_text)
+
+    filters = [
+        "format=yuv420p",
+        "drawtext="
+        f"textfile={escape_drawtext_value(base_text_file)}:"
+        f"font='{escaped_font}':"
+        f"fontcolor={BASE_FONT_COLOR}:"
+        f"fontsize={FONT_SIZE}:"
+        f"line_spacing={LINE_SPACING}:"
+        "x=(w-text_w)/2:"
+        f"y={top_y_expr}",
+    ]
+
+    # We render highlights as separate drawtext layers that share the same scroll math.
+    # This keeps the highlighted phrase aligned with the base text while timing is driven by audio.
+    phrase_files = []
+    for (start, end), (start_time, end_time) in zip(phrases, phrase_timings):
+        phrase_text = build_phrase_text(words, word_line_index, start, end)
+        phrase_file = f"{output_path}.phrase.{start}.txt"
+        with open(phrase_file, "w", encoding="utf-8") as handle:
+            handle.write(phrase_text)
+        phrase_files.append(phrase_file)
+
+        start_line = word_line_index[start]
+        phrase_y_expr = f"({top_y_expr})+{start_line * line_height}"
+        enable_expr = f"between(t\\,{start_time:.6f}\\,{end_time:.6f})"
+        filters.append(
+            "drawtext="
+            f"textfile={escape_drawtext_value(phrase_file)}:"
+            f"font='{escaped_font}':"
+            f"fontcolor={HIGHLIGHT_FONT_COLOR}:"
+            f"fontsize={FONT_SIZE}:"
+            f"line_spacing={LINE_SPACING}:"
+            "x=(w-text_w)/2:"
+            f"y={phrase_y_expr}:"
+            f"box=1:boxcolor={HIGHLIGHT_BG_COLOR}@1.0:boxborderw=8:"
+            f"enable='{enable_expr}'"
+        )
+
+    filter_chain = ",".join(filters)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c={background_color}:s={width}x{height}:d={total_duration}",
+        "-vf",
+        filter_chain,
+        "-r",
+        str(DEFAULT_FPS),
+        # H.264 is widely accepted by Instagram and keeps output sizes reasonable.
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        output_path,
+    ]
+    run_command(cmd)
+
+    os.remove(base_text_file)
+    for phrase_file in phrase_files:
+        os.remove(phrase_file)
+
+
+def mux_audio(video_path, audio_path, output_path):
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            output_path,
+        ]
+    )
+
+
+def ensure_parent_dir(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def main():
+    args = parse_args()
+
+    try:
+        config = read_config(os.getcwd())
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc))
+        sys.exit(1)
+
+    interactive = args.input is None or args.output is None
+    input_path = args.input
+    output_path = args.output
+
+    if interactive:
+        print("Entering interactive mode. You can pass --input and --output to skip prompts.\n")
+
+        if output_path is None:
+            output_path = prompt_output_path()
+
+        style = prompt_style_choices()
+        voice_id = prompt_voice_choice(config["voices"], config["default_voice_id"])
+
+        if input_path is None:
+            text = prompt_multiline_text()
+        else:
+            text = read_input_text(input_path)
+    else:
+        style = select_style_defaults()
+        voice_id = config["default_voice_id"]
+        text = read_input_text(input_path)
+
+    text = normalize_newlines(sanitize_text(text))
+    if not text:
+        print("No input text provided.")
+        sys.exit(1)
+
+    ensure_tool_available("ffmpeg")
+    ensure_tool_available("ffprobe")
+    ensure_tool_available("node")
+
+    ensure_parent_dir(output_path)
+
+    layout_tokens = build_layout_tokens(text)
+    words, phrases = build_words_and_phrases(layout_tokens)
+    if not words:
+        print("No words found in input text.")
+        sys.exit(1)
+    if not phrases:
+        print("No phrases found in input text.")
+        sys.exit(1)
+
+    skip_tts = os.getenv("CAPTIONS_SKIP_TTS") == "1"
+    if skip_tts:
+        print("Skipping TTS (CAPTIONS_SKIP_TTS=1). Using silent audio for timing.")
+    else:
+        print("Generating voiceover with ElevenLabs...")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        audio_path = os.path.join(temp_dir, "voice.mp3")
+        if skip_tts:
+            duration = estimate_duration_seconds(len(words))
+            generate_silent_audio(duration, audio_path)
+        else:
+            call_elevenlabs_tts(text, voice_id, config["api_key"], audio_path)
+            print("Analyzing audio duration...")
+            duration = get_audio_duration_seconds(audio_path)
+        phrase_word_counts = [end - start + 1 for start, end in phrases]
+        phrase_durations = compute_phrase_durations(duration, phrase_word_counts)
+        phrase_timings = []
+        cursor = 0.0
+        for segment in phrase_durations:
+            start_time = cursor
+            end_time = cursor + segment
+            phrase_timings.append((start_time, end_time))
+            cursor = end_time
+
+        print("Rendering teleprompter video...")
+        video_path = os.path.join(temp_dir, "scrolling.mp4")
+        render_data = {
+            "words": words,
+            "layoutTokens": layout_tokens,
+            "phrases": [{"start": start, "end": end} for start, end in phrases],
+            "phraseTimings": [
+                {"start": start_time, "end": end_time} for start_time, end_time in phrase_timings
+            ],
+            "duration": duration,
+            "style": {
+                "background": style["background"],
+                "baseColor": BASE_FONT_COLOR,
+                "highlightBg": HIGHLIGHT_BG_COLOR,
+                "highlightText": HIGHLIGHT_FONT_COLOR,
+                "fontFamily": style["font_name"],
+                "fontSize": FONT_SIZE,
+                "lineSpacing": LINE_SPACING,
+            },
+        }
+        run_node_renderer(render_data, video_path, style["resolution"])
+
+        print("Muxing audio...")
+        mux_audio(video_path, audio_path, output_path)
+
+    print(f"Done. Video written to {output_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)

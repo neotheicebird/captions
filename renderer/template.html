@@ -1,0 +1,213 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Captions Renderer</title>
+    <style>
+      :root {
+        --bg: #000000;
+        --text: #222222;
+        --highlight-bg: #222222;
+        --highlight-text: #dddddd;
+        --font-family: "Helvetica Neue", "Apple Color Emoji", "SF Pro Text", Arial, sans-serif;
+        --font-size: 82px;
+        --line-spacing: 20px;
+      }
+
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--bg);
+        overflow: hidden;
+      }
+
+      #viewport {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+      }
+
+      #content {
+        position: absolute;
+        left: 10%;
+        transform: translateY(0);
+        color: var(--text);
+        font-family: var(--font-family);
+        font-size: var(--font-size);
+        line-height: calc(var(--font-size) + var(--line-spacing));
+        text-align: left;
+        white-space: pre-wrap;
+        width: 80%;
+        top: 10%;
+      }
+
+      .word {
+        display: inline;
+      }
+
+      .phrase {
+        display: inline;
+      }
+
+      .phrase.active {
+        background: var(--highlight-bg);
+        color: var(--highlight-text);
+        padding: 0.05em 0.2em;
+        border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="viewport">
+      <div id="content"></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+    <script>
+      const data = __DATA__;
+
+      const viewport = document.getElementById("viewport");
+      const content = document.getElementById("content");
+
+      document.documentElement.style.setProperty("--bg", data.style.background);
+      document.documentElement.style.setProperty("--text", data.style.baseColor);
+      document.documentElement.style.setProperty("--highlight-bg", data.style.highlightBg);
+      document.documentElement.style.setProperty("--highlight-text", data.style.highlightText);
+      document.documentElement.style.setProperty("--font-family", data.style.fontFamily);
+      document.documentElement.style.setProperty("--font-size", `${data.style.fontSize}px`);
+      document.documentElement.style.setProperty("--line-spacing", `${data.style.lineSpacing}px`);
+
+      const words = data.words;
+      const layoutTokens = data.layoutTokens || data.words;
+      const phrases = data.phrases;
+      const phraseTimings = data.phraseTimings;
+
+      const phraseNodes = [];
+      const wordNodes = [];
+      const wordToPhrase = new Array(words.length);
+
+      let currentPhrase = 0;
+      let wordIndex = 0;
+      phrases.forEach((phrase, phraseIndex) => {
+        for (let i = phrase.start; i <= phrase.end; i += 1) {
+          wordToPhrase[i] = phraseIndex;
+        }
+      });
+
+      let previousPhraseIndex = -1;
+      let previousTokenWasWord = false;
+
+      layoutTokens.forEach((token) => {
+        if (token === "\n") {
+          content.appendChild(document.createElement("br"));
+          previousPhraseIndex = -1;
+          previousTokenWasWord = false;
+          return;
+        }
+
+        const phraseIndex = wordToPhrase[wordIndex] ?? 0;
+        if (!phraseNodes[phraseIndex]) {
+          const phraseSpan = document.createElement("span");
+          phraseSpan.className = "phrase";
+          phraseSpan.dataset.phrase = phraseIndex.toString();
+          if (previousTokenWasWord && phraseIndex !== previousPhraseIndex) {
+            content.appendChild(document.createTextNode(" "));
+          }
+          content.appendChild(phraseSpan);
+          phraseNodes[phraseIndex] = phraseSpan;
+        }
+
+        const phraseSpan = phraseNodes[phraseIndex];
+        const wordSpan = document.createElement("span");
+        wordSpan.className = "word";
+        wordSpan.textContent = token;
+        phraseSpan.appendChild(wordSpan);
+        wordNodes.push(wordSpan);
+
+        if (wordIndex < phrases[phraseIndex].end) {
+          phraseSpan.appendChild(document.createTextNode(" "));
+        }
+
+        previousPhraseIndex = phraseIndex;
+        previousTokenWasWord = true;
+        wordIndex += 1;
+      });
+
+      function computePhraseCenters() {
+        const contentRect = content.getBoundingClientRect();
+        return phraseNodes.map((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.top - contentRect.top + rect.height / 2;
+        });
+      }
+
+      function findActivePhrase(time) {
+        for (let i = 0; i < phraseTimings.length; i += 1) {
+          const timing = phraseTimings[i];
+          if (time >= timing.start && time < timing.end) {
+            return i;
+          }
+        }
+        return phraseTimings.length - 1;
+      }
+
+      function buildScrollPlan() {
+        const viewportCenter = viewport.clientHeight * 0.5;
+        const centers = computePhraseCenters();
+        let scrollStartTime = 0;
+
+        for (let i = 0; i < centers.length; i += 1) {
+          if (centers[i] >= viewportCenter) {
+            scrollStartTime = phraseTimings[i]?.start || 0;
+            break;
+          }
+        }
+
+        const lastCenter = centers[centers.length - 1] || 0;
+        const totalScrollDistance = Math.max(lastCenter - viewportCenter, 0);
+        const availableTime = Math.max(data.duration - scrollStartTime, 0.001);
+        const speed = totalScrollDistance / availableTime;
+
+        return { scrollStartTime, speed, viewportCenter };
+      }
+
+      const scrollPlan = buildScrollPlan();
+
+      const lines = phraseNodes;
+      const entryTimeline = gsap.timeline({ delay: 0.3 });
+      entryTimeline.from(lines, {
+        duration: 0.8,
+        opacity: 0,
+        scale: 0,
+        y: 80,
+        rotationX: 180,
+        transformOrigin: "0% 50% -50",
+        ease: "back",
+        stagger: 0.1,
+      });
+
+      window.__seek = (time) => {
+        let offset = 0;
+        if (time >= scrollPlan.scrollStartTime) {
+          offset = -(time - scrollPlan.scrollStartTime) * scrollPlan.speed;
+        }
+        content.style.transform = `translateY(${offset}px)`;
+
+        const active = findActivePhrase(time);
+        if (active !== currentPhrase) {
+          phraseNodes[currentPhrase]?.classList.remove("active");
+          phraseNodes[active]?.classList.add("active");
+          currentPhrase = active;
+        }
+      };
+
+      window.__duration = data.duration;
+      currentPhrase = -1;
+      window.__seek(0);
+    </script>
+  </body>
+</html>

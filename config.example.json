@@ -1,0 +1,23 @@
+{
+  "elevenlabsApiKey": "YOUR_API_KEY",
+  "defaultVoiceId": "VOICE_ID",
+  "voices": [
+    {
+      "id": "VOICE_ID",
+      "label": "Warm Narrator"
+    },
+    {
+      "id": "VOICE_ID_2",
+      "label": "Energetic Host"
+    },
+
+    {
+      "id": "8Ln42OXYupYsag45MAUy",
+      "label": "Wise Science Prof. Narrator"
+    },
+    {
+      "id": "zYcjlYFOd3taleS0gkk3",
+      "label": "Energetic Host"
+    }
+  ]
+}

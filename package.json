@@ -1,0 +1,9 @@
+{
+  "name": "captions-renderer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer": "^23.5.0"
+  }
+}

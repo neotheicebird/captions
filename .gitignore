@@ -1,0 +1,10 @@
+# Local secrets
+config.json
+
+# Node artifacts
+node_modules
+
+# OS cruft
+.DS_Store
+*.mp4
+.venv
