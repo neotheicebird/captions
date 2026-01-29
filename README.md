@@ -2,7 +2,8 @@ Captions is a text to teleprompter style video generator along with elevenlabs a
 
 Demo:
 
-[![watch the video on instagram →](thumbnail.png)](https://www.instagram.com/reel/DUFVsB4iXNg/?utm_source=ig_web_copy_link)
+[Thumbnail](thumbnail.png)
+[watch the video on instagram →](https://www.instagram.com/reel/DUFVsB4iXNg/?utm_source=ig_web_copy_link)
 
 v1
 
